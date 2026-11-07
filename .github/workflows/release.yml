@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE: frpc-tray-windows-x64
+
+jobs:
+  release:
+    name: Publish release (windows-latest)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve and verify version
+        id: meta
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $tag = $env:GITHUB_REF.Substring(10)
+          } elseif ($env:INPUT_TAG) {
+            $tag = $env:INPUT_TAG
+          } else {
+            throw "No tag: push a v* tag or run the workflow with a tag input."
+          }
+
+          $match = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"(?<v>[^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Cannot read version from Cargo.toml" }
+          $version = $match.Matches[0].Groups["v"].Value
+
+          if ($tag -ne "v$version") {
+            throw "Tag $tag does not match Cargo.toml version v$version"
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "Releasing $tag"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = $env:PACKAGE
+
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/frpc-tray.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "$name.zip" -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -NoNewline -Encoding ascii SHA256SUMS.txt
+
+          Write-Output "Packaged $name.zip"
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            ${{ env.PACKAGE }}.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          files: |
+            ${{ env.PACKAGE }}.zip
+            SHA256SUMS.txt
+          prerelease: ${{ contains(steps.meta.outputs.tag, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

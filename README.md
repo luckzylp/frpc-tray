@@ -88,13 +88,17 @@ frp/
 
 ## CI/CD
 
-`.github/workflows/windows-build.yml` builds the project on `windows-latest`:
+Two workflows run on `windows-latest`:
 
-- **Push to `main` / `master`, pull requests, manual runs** — compiles a release binary with
-  `cargo build --release --locked`, zips it and uploads `frpc-tray-windows-x64.zip` as a
-  workflow artifact.
-- **Push a `v*` tag** (for example `git tag v0.1.0 && git push origin v0.1.0`) — additionally
-  creates a GitHub Release with the zip attached and auto-generated release notes.
+- **CI** (`.github/workflows/ci.yml`) — on pushes to `main` / `master`, pull requests and manual
+  runs: builds with `cargo build --release --locked`, runs `cargo test --locked`, and runs
+  `cargo clippy` as an advisory (non-blocking) check.
+- **Release** (`.github/workflows/release.yml`) — triggered by pushing a `v*` tag (for example
+  `git tag v0.2.0 && git push origin v0.2.0`) or manually via *Run workflow* with an existing
+  tag. It verifies the tag matches the `version` in `Cargo.toml`, builds the binary, packs
+  `frpc-tray.exe` with `README.md` and `LICENSE` into `frpc-tray-windows-x64.zip`, writes
+  `SHA256SUMS.txt`, and publishes a GitHub Release with generated release notes. Tags containing
+  a hyphen (`v0.3.0-beta.1`) are published as pre-releases.
 
 ## License
 
