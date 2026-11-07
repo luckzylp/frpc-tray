@@ -130,8 +130,7 @@ fn handle_menu_event(
         redownload_command(state);
     } else if id == ID_QUIT {
         quit_command(state, control_flow);
-    } else if id.starts_with(ID_CONFIG_PREFIX) {
-        let name = &id[ID_CONFIG_PREFIX.len()..];
+    } else if let Some(name) = id.strip_prefix(ID_CONFIG_PREFIX) {
         switch_config(state, name.to_string());
         rebuild(tray, state);
     }
@@ -144,7 +143,7 @@ fn rebuild(tray: &tray_icon::TrayIcon, state: &SharedState) {
         let icon = tray::icon_for_state(&s);
         (menu, icon)
     };
-    let _ = tray.set_menu(Some(Box::new(menu)));
+    tray.set_menu(Some(Box::new(menu)));
     let _ = tray.set_icon(Some(icon));
 }
 

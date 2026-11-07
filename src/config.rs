@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub fn base_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("cannot get current_exe");
-    let dir = exe.parent().expect("exe has no parent").to_path_buf();
-    dir
+    exe.parent().expect("exe has no parent").to_path_buf()
 }
 
 pub fn app_dir() -> PathBuf {

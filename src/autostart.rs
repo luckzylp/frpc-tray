@@ -1,5 +1,4 @@
 use std::env;
-use std::path::PathBuf;
 
 use winreg::enums::*;
 use winreg::RegKey;
@@ -10,10 +9,7 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub fn is_autostart() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     match hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ) {
-        Ok(key) => match key.get_value::<String, _>(AUTOSTART_NAME) {
-            Ok(_) => true,
-            Err(_) => false,
-        },
+        Ok(key) => key.get_value::<String, _>(AUTOSTART_NAME).is_ok(),
         Err(_) => false,
     }
 }
@@ -32,8 +28,4 @@ pub fn set_autostart(enable: bool) {
     } else {
         let _ = key.delete_value(AUTOSTART_NAME);
     }
-}
-
-pub fn autostart_path() -> Option<PathBuf> {
-    env::current_exe().ok()
 }

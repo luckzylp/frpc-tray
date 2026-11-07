@@ -76,7 +76,7 @@ pub fn build_menu(state: &AppState) -> Menu {
     } else {
         for name in &configs {
             let id = format!("{}{}", ID_CONFIG_PREFIX, name);
-            let checked = current.map_or(false, |c| c == name.as_str());
+            let checked = current.is_some_and(|c| c == name.as_str());
             cfg_items.push(Box::new(CheckMenuItem::with_id(&id, name, true, checked, None)));
         }
     }
