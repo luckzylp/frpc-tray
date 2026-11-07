@@ -1,8 +1,7 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -252,40 +251,58 @@ pub fn extract_frpc(zip_path: &Path, dest: &Path, entry_name: &str) -> Result<()
     Err(format!("zip 中未找到 {}", entry_name))
 }
 
+const FRPC_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+fn open_log(path: &Path) -> io::Result<fs::File> {
+    let oversized = path
+        .metadata()
+        .map(|m| m.len() > FRPC_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if oversized {
+        let _ = fs::remove_file(path);
+    }
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
 pub fn start_frpc(exe: &Path, config_path: &Path) -> Result<Child, String> {
     let mut cmd = Command::new(exe);
-    cmd.arg("-c")
-        .arg(config_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.arg("-c").arg(config_path);
+
+    // Relative paths in the config resolve against the working directory.
+    if let Some(dir) = config_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.current_dir(dir);
+    }
+
+    // frpc writes its output straight to a dedicated log file instead of a
+    // pipe, so no reader thread has to be drained to keep frpc unblocked.
+    let log_path = crate::config::logs_dir().join("frpc.log");
+    match open_log(&log_path) {
+        Ok(file) => {
+            let stderr_file = file
+                .try_clone()
+                .map_err(|e| format!("复制日志文件句柄失败: {}", e))?;
+            cmd.stdout(Stdio::from(file));
+            cmd.stderr(Stdio::from(stderr_file));
+        }
+        Err(e) => {
+            logger::log(&format!(
+                "无法打开 frpc 日志文件 ({}): {}",
+                log_path.display(),
+                e
+            ));
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+    }
+
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let mut child = cmd
+
+    let child = cmd
         .spawn()
         .map_err(|e| format!("启动 frpc 失败: {}", e))?;
 
     logger::log(&format!("frpc 已启动 (pid={})", child.id()));
-
-    if let Some(stdout) = child.stdout.take() {
-        thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    logger::log(&line);
-                }
-            }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    logger::log(&line);
-                }
-            }
-        });
-    }
 
     Ok(child)
 }

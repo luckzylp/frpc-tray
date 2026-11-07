@@ -80,6 +80,11 @@ fn main() {
     event_loop.run(move |_event, _target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(200));
 
+        if let Some(status) = reap_exited_frpc(&state_clone) {
+            logger::log(&format!("frpc 已退出 ({})，详见 frpc.log", status));
+            rebuild(&tray_clone, &state_clone);
+        }
+
         if let Ok(result) = dl_rx.try_recv() {
             match result {
                 Ok(path) => {
@@ -141,6 +146,24 @@ fn rebuild(tray: &tray_icon::TrayIcon, state: &SharedState) {
     };
     let _ = tray.set_menu(Some(Box::new(menu)));
     let _ = tray.set_icon(Some(icon));
+}
+
+fn reap_exited_frpc(state: &SharedState) -> Option<std::process::ExitStatus> {
+    let mut s = state.lock().ok()?;
+    let status = match s.child.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => None,
+            Err(e) => {
+                logger::log(&format!("读取 frpc 进程状态失败: {}", e));
+                None
+            }
+        },
+        None => None,
+    };
+    let status = status?;
+    s.child = None;
+    Some(status)
 }
 
 fn start_command(state: &SharedState) {

@@ -11,8 +11,10 @@ configuration files from the tray menu, and downloads or updates the `frpc.exe` 
 
 - **Tray status icon** — different icons for *running*, *idle* (binary ready, stopped) and
   *no binary*.
-- **Start / stop frpc** from the tray menu; `frpc` runs without a console window and its
-  stdout/stderr are captured into the application log.
+- **Start / stop frpc** from the tray menu; `frpc` runs without a console window, with its
+  working directory set to the config folder.
+- **Crash visibility** — if `frpc` exits on its own the icon returns to *idle* and the exit
+  code is logged.
 - **Multiple configurations** — every `*.toml` / `*.ini` file in `frp/config` shows up in the
   `配置` submenu. Switching while running restarts `frpc` with the new file.
 - **Automatic frpc provisioning** — on first launch the matching `frpc.exe` is downloaded from
@@ -23,7 +25,8 @@ configuration files from the tray menu, and downloads or updates the `frpc.exe` 
   `.bak` rollback.
 - **Start with Windows** — per-user autostart via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - **Single instance** — launching a second copy simply exits.
-- **Logging** — all app and frpc output is appended to `frp/logs/frpc-tray.log`.
+- **Logging** — app events are appended to `frp/logs/frpc-tray.log`; `frpc`'s own output goes
+  to `frp/logs/frpc.log`, which is truncated once it exceeds 2 MB.
 
 > The tray menu is currently in Chinese only.
 
@@ -70,7 +73,8 @@ frp/
 ├── config/               # your frpc configuration files (*.toml, *.ini)
 │   └── frpc.toml
 └── logs/
-    └── frpc-tray.log     # application and frpc output log
+    ├── frpc-tray.log     # application events
+    └── frpc.log          # frpc output
 ```
 
 `settings.json` holds:
