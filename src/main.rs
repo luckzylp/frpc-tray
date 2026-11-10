@@ -1,9 +1,12 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Hide the console window on Windows release builds only. On Unix there is no
+// such subsystem attribute, so the whole cfg_attr must be gated too.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod autostart;
 mod config;
 mod frpc;
 mod logger;
+mod platform;
 mod tray;
 
 use std::path::PathBuf;
@@ -12,19 +15,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tao::event_loop::{ControlFlow, EventLoop};
-use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconBuilder;
+use tray_icon::menu::MenuEvent;
 
 use config::Settings;
-use frpc::{check_update, ensure_frpc, start_frpc, stop_frpc, FRP_VERSION};
+use frpc::{FRP_VERSION, check_update, ensure_frpc, start_frpc, stop_frpc};
+use platform::BINARY_NAME;
 use tray::{
-    build_menu, AppState, SharedState,
-    ID_AUTOSTART, ID_CHECK_UPDATE, ID_CONFIG_PREFIX, ID_QUIT, ID_REDOWNLOAD,
-    ID_START, ID_STOP,
+    AppState, ID_AUTOSTART, ID_CHECK_UPDATE, ID_CONFIG_PREFIX, ID_QUIT, ID_REDOWNLOAD, ID_START,
+    ID_STOP, SharedState, build_menu,
 };
 
 fn main() {
-    let instance = match single_instance::SingleInstance::new("frpc-tray-single-instance") {
+    let instance = match single_instance::SingleInstance::new(&single_instance_name()) {
         Ok(i) => i,
         Err(_) => return,
     };
@@ -46,7 +49,10 @@ fn main() {
     logger::log(&format!("frpc-tray 启动，frp 版本 {}", current_ver));
 
     let configs = config::list_configs();
-    let initial_current = settings.last_config.clone().or_else(|| config::default_config(&configs));
+    let initial_current = settings
+        .last_config
+        .clone()
+        .or_else(|| config::default_config(&configs));
 
     let state = Arc::new(Mutex::new(AppState::new(settings, None)));
     {
@@ -59,7 +65,14 @@ fn main() {
 
     silent_check_update_async(&state, &current_ver);
 
-    let event_loop = EventLoop::new();
+    #[allow(unused_mut)]
+    let mut event_loop = EventLoop::new();
+    // A tray-only app should not occupy a Dock icon / menu bar on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
 
     let (icon, menu) = {
         let s = state.lock().unwrap();
@@ -88,14 +101,14 @@ fn main() {
         if let Ok(result) = dl_rx.try_recv() {
             match result {
                 Ok(path) => {
-                    logger::log(&format!("frpc.exe 就绪: {}", path.display()));
+                    logger::log(&format!("{} 就绪: {}", BINARY_NAME, path.display()));
                     if let Ok(mut s) = state_clone.lock() {
                         s.frpc_path = Some(path);
                     }
                     rebuild(&tray_clone, &state_clone);
                 }
                 Err(e) => {
-                    logger::log(&format!("获取 frpc.exe 失败: {}", e));
+                    logger::log(&format!("获取 {} 失败: {}", BINARY_NAME, e));
                 }
             }
         }
@@ -105,6 +118,24 @@ fn main() {
             handle_menu_event(&id, &state_clone, &tray_clone, control_flow);
         }
     });
+}
+
+/// `single-instance` uses a named mutex on Windows, an abstract socket on
+/// Linux, but a **file path** on macOS (it flock()s that file). Using the same
+/// bare name everywhere would create a stray file in the working directory on
+/// macOS and break when the CWD is read-only.
+fn single_instance_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return config::base_dir()
+            .join("frpc-tray.lock")
+            .to_string_lossy()
+            .into_owned();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "frpc-tray-single-instance".to_string()
+    }
 }
 
 fn handle_menu_event(
@@ -122,7 +153,7 @@ fn handle_menu_event(
     } else if id == ID_AUTOSTART {
         let now = autostart::is_autostart();
         autostart::set_autostart(!now);
-        logger::log(&format!("开机自启已{}", if !now { "开启" } else { "关闭" }));
+        logger::log(&format!("自动启动已{}", if !now { "开启" } else { "关闭" }));
         rebuild(tray, state);
     } else if id == ID_CHECK_UPDATE {
         check_update_command(state);
@@ -174,7 +205,7 @@ fn start_command(state: &SharedState) {
     let exe = match &s.frpc_path {
         Some(p) => p.clone(),
         None => {
-            logger::log("frpc.exe 不可用，请先重新下载");
+            logger::log(&format!("{} 不可用，请先重新下载", BINARY_NAME));
             return;
         }
     };
@@ -236,7 +267,10 @@ fn check_update_command(state: &SharedState) {
     thread::spawn(move || {
         let current_ver = {
             let s = state.lock().unwrap();
-            s.settings.frpc_version.clone().unwrap_or_else(|| FRP_VERSION.to_string())
+            s.settings
+                .frpc_version
+                .clone()
+                .unwrap_or_else(|| FRP_VERSION.to_string())
         };
 
         match check_update(&current_ver) {
@@ -269,23 +303,19 @@ fn do_update(new_ver: &str, state: &SharedState) -> Result<(), String> {
     }
 
     let exe_path = frpc::frpc_exe_path();
-    let new_path = config::frpc_dir().join("frpc.exe.new");
-    let bak_path = config::frpc_dir().join("frpc.exe.bak");
-    let zip_path = config::frpc_dir().join("frp_update.zip");
+    let new_path = config::frpc_dir().join(format!("{}.new", BINARY_NAME));
+    let bak_path = config::frpc_dir().join(format!("{}.bak", BINARY_NAME));
+    let archive_path = config::frpc_dir().join(format!("frp_update.{}", platform::ARCHIVE_EXT));
 
-    let url = format!(
-        "https://github.com/fatedier/frp/releases/download/v{}/frp_{}_windows_amd64.zip",
-        new_ver, new_ver
-    );
+    let url = platform::download_url(new_ver)?;
     logger::log(&format!("下载 v{}", new_ver));
-    frpc::download_internal(&url, &zip_path)?;
+    frpc::download_internal(&url, &archive_path)?;
 
-    let entry = format!("frp_{}_windows_amd64/frpc.exe", new_ver);
-    frpc::extract_frpc(&zip_path, &new_path, &entry)?;
-    let _ = std::fs::remove_file(&zip_path);
+    frpc::extract_frpc(&archive_path, &new_path, new_ver)?;
+    let _ = std::fs::remove_file(&archive_path);
 
     if !new_path.exists() {
-        return Err("解压后未找到 frpc.exe".into());
+        return Err(format!("解压后未找到 {}", BINARY_NAME));
     }
 
     let _ = std::fs::remove_file(&bak_path);
@@ -296,7 +326,7 @@ fn do_update(new_ver: &str, state: &SharedState) -> Result<(), String> {
         if bak_path.exists() {
             let _ = std::fs::rename(&bak_path, &exe_path);
         }
-        return Err("替换 frpc.exe 失败".into());
+        return Err(format!("替换 {} 失败", BINARY_NAME));
     }
     let _ = std::fs::remove_file(&bak_path);
 
@@ -324,19 +354,20 @@ fn redownload_command(state: &SharedState) {
     let state = state.clone();
     let ver = {
         let s = state.lock().unwrap();
-        s.settings.frpc_version.clone().unwrap_or_else(|| FRP_VERSION.to_string())
+        s.settings
+            .frpc_version
+            .clone()
+            .unwrap_or_else(|| FRP_VERSION.to_string())
     };
-    thread::spawn(move || {
-        match ensure_frpc(&ver) {
-            Ok(p) => {
-                logger::log(&format!("frpc 下载完成: {}", p.display()));
-                if let Ok(mut s) = state.lock() {
-                    s.frpc_path = Some(p);
-                }
+    thread::spawn(move || match ensure_frpc(&ver) {
+        Ok(p) => {
+            logger::log(&format!("frpc 下载完成: {}", p.display()));
+            if let Ok(mut s) = state.lock() {
+                s.frpc_path = Some(p);
             }
-            Err(e) => {
-                logger::log(&format!("下载失败: {}", e));
-            }
+        }
+        Err(e) => {
+            logger::log(&format!("下载失败: {}", e));
         }
     });
 }
@@ -355,16 +386,14 @@ fn quit_command(state: &SharedState, _control_flow: &mut ControlFlow) {
 fn ensure_frpc_async(tx: &std::sync::mpsc::Sender<Result<PathBuf, String>>, version: &str) {
     let tx = tx.clone();
     let version = version.to_string();
-    thread::spawn(move || {
-        match ensure_frpc(&version) {
-            Ok(p) => {
-                logger::log(&format!("frpc.exe 就绪: {}", p.display()));
-                let _ = tx.send(Ok(p));
-            }
-            Err(e) => {
-                logger::log(&format!("获取 frpc.exe 失败: {}", e));
-                let _ = tx.send(Err(e));
-            }
+    thread::spawn(move || match ensure_frpc(&version) {
+        Ok(p) => {
+            logger::log(&format!("{} 就绪: {}", BINARY_NAME, p.display()));
+            let _ = tx.send(Ok(p));
+        }
+        Err(e) => {
+            logger::log(&format!("获取 {} 失败: {}", BINARY_NAME, e));
+            let _ = tx.send(Err(e));
         }
     });
 }
@@ -375,7 +404,10 @@ fn silent_check_update_async(_state: &SharedState, current_ver: &str) {
         thread::sleep(Duration::from_secs(3));
         match check_update(&current_ver) {
             Ok(Some(new_ver)) => {
-                logger::log(&format!("发现新版本 v{}，可在菜单中点击「检查更新」进行升级", new_ver));
+                logger::log(&format!(
+                    "发现新版本 v{}，可在菜单中点击「检查更新」进行升级",
+                    new_ver
+                ));
             }
             Ok(None) => {
                 // silent, no log

@@ -1,10 +1,10 @@
-use std::sync::{Arc, Mutex};
 use std::process::Child;
+use std::sync::{Arc, Mutex};
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::Icon;
+use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::config::{list_configs, Settings};
+use crate::config::{Settings, list_configs};
 
 pub const ID_START: &str = "start";
 pub const ID_STOP: &str = "stop";
@@ -72,24 +72,32 @@ pub fn build_menu(state: &AppState) -> Menu {
     let current = state.current_config.as_deref();
     let mut cfg_items: Vec<Box<dyn tray_icon::menu::IsMenuItem>> = Vec::new();
     if configs.is_empty() {
-        cfg_items.push(Box::new(MenuItem::with_id("no_config", "(无配置文件)", true, None)));
+        cfg_items.push(Box::new(MenuItem::with_id(
+            "no_config",
+            "(无配置文件)",
+            true,
+            None,
+        )));
     } else {
         for name in &configs {
             let id = format!("{}{}", ID_CONFIG_PREFIX, name);
             let checked = current.is_some_and(|c| c == name.as_str());
-            cfg_items.push(Box::new(CheckMenuItem::with_id(&id, name, true, checked, None)));
+            cfg_items.push(Box::new(CheckMenuItem::with_id(
+                &id, name, true, checked, None,
+            )));
         }
     }
-    let cfg_refs: Vec<&dyn tray_icon::menu::IsMenuItem> = cfg_items.iter().map(|b| b.as_ref()).collect();
-    let submenu = Submenu::with_items("配置", true, &cfg_refs)
-        .unwrap_or_else(|_| Submenu::new("配置", true));
+    let cfg_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
+        cfg_items.iter().map(|b| b.as_ref()).collect();
+    let submenu =
+        Submenu::with_items("配置", true, &cfg_refs).unwrap_or_else(|_| Submenu::new("配置", true));
     let _ = menu.append(&submenu);
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let autostart = CheckMenuItem::with_id(
         ID_AUTOSTART,
-        "开机自启",
+        "自动启动",
         true,
         crate::autostart::is_autostart(),
         None,

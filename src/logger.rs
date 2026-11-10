@@ -6,7 +6,7 @@ use crate::config::logs_dir;
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
 
-/// Append a line to `<exe_dir>/frp/logs/frpc-tray.log`. Best-effort; errors
+/// Append a line to `<base_dir>/frp/logs/frpc-tray.log`. Best-effort; errors
 /// are swallowed so logging never breaks app flow.
 pub fn log(msg: &str) {
     let path = logs_dir().join("frpc-tray.log");

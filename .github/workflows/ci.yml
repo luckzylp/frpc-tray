@@ -18,12 +18,26 @@ env:
 
 jobs:
   build:
-    name: Build and test (windows-latest)
-    runs-on: windows-latest
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # tray-icon's default Linux backend uses GTK 3 + AppIndicator through
+      # muda/tao. These are the equivalent of the "GTK development packages"
+      # listed in tray-icon's README.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
