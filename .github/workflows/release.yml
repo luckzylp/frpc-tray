@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish, e.g. v0.2.0"
+        description: "Tag already pushed to the remote, e.g. v0.2.0 (create it first: git tag -a v0.2.0 -m 'v0.2.0' && git push origin v0.2.0)"
         required: true
         type: string
 
@@ -23,11 +23,36 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # A manual run can reference a tag that was created locally but never pushed
+      # (or simply mistyped). checkout@v4 then fails with the opaque message
+      # "A branch or tag with the name ... could not be found". Fail early here
+      # with an actionable message instead.
+      - name: Verify tag exists on remote
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${TAG#refs/tags/}"
+          if [[ ! "$tag" =~ ^v[^/[:space:]]+$ ]]; then
+            echo "::error::Invalid tag '$TAG'. Use the short tag name, e.g. v0.2.0"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag '$tag' is not available on ${GITHUB_REPOSITORY} (missing tag or no access)."
+            echo "::error::Create and push it first: git tag -a $tag -m '$tag' && git push origin $tag"
+            exit 1
+          fi
+          echo "Tag $tag found on ${GITHUB_REPOSITORY}"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Resolve and verify version
         id: meta
@@ -37,10 +62,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ($env:GITHUB_REF -like "refs/tags/v*") {
+          if ($env:INPUT_TAG) {
+            $tag = $env:INPUT_TAG -replace '^refs/tags/', ''
+          } elseif ($env:GITHUB_REF -like "refs/tags/v*") {
             $tag = $env:GITHUB_REF.Substring(10)
-          } elseif ($env:INPUT_TAG) {
-            $tag = $env:INPUT_TAG
           } else {
             throw "No tag: push a v* tag or run the workflow with a tag input."
           }

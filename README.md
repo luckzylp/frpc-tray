@@ -1,6 +1,6 @@
 # frpc-tray
 
-[![Windows Build](https://github.com/luckzylp/frpc-tray/actions/workflows/windows-build.yml/badge.svg)](https://github.com/luckzylp/frpc-tray/actions/workflows/windows-build.yml)
+[![CI](https://github.com/luckzylp/frpc-tray/actions/workflows/ci.yml/badge.svg)](https://github.com/luckzylp/frpc-tray/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A lightweight Windows system-tray manager for [frpc](https://github.com/fatedier/frp). It keeps
@@ -99,6 +99,23 @@ Two workflows run on `windows-latest`:
   `frpc-tray.exe` with `README.md` and `LICENSE` into `frpc-tray-windows-x64.zip`, writes
   `SHA256SUMS.txt`, and publishes a GitHub Release with generated release notes. Tags containing
   a hyphen (`v0.3.0-beta.1`) are published as pre-releases.
+
+### Publishing a release
+
+The release workflow can only check out a ref that **already exists on GitHub**. A tag created
+locally but never pushed — or a typo in the *Run workflow* input — makes `actions/checkout@v4`
+fail with `A branch or tag with the name 'vX.Y.Z' could not be found`. Make sure the tag matches
+the `version` in `Cargo.toml`, then create and push it:
+
+```powershell
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin main
+git push origin v0.2.0
+```
+
+Pushing the tag triggers the release automatically. Alternatively, use *Run workflow* in the
+Actions tab with a tag that is already on the remote; the workflow verifies that the tag exists
+before checkout and fails with an actionable hint if it does not.
 
 ## License
 
