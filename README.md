@@ -35,6 +35,11 @@ binary for your OS and CPU.
 - **Update check** — compares the installed frp version with the latest GitHub release at
   startup (silently) and on demand from the menu, then replaces the binary atomically with a
   `.bak` rollback.
+- **STUN server picker** — probes a live list of public STUN servers (by default from
+  [always-online-stun](https://github.com/pradt2/always-online-stun)) with real RFC 5389
+  binding requests, shows the latency / quality of the fastest ones, and writes the server you
+  pick into the active `frpc` config (`natHoleStunServer` / `nat_hole_stun_server`). Sources are
+  user editable.
 - **Start on login** — per-user autostart, implemented natively per platform (see below).
 - **Single instance** — launching a second copy simply exits.
 - **Logging** — app events are appended to `frp/logs/frpc-tray.log`; `frpc`'s own output goes
@@ -94,6 +99,8 @@ Output: `target/release/frpc-tray.exe` (Windows) or `target/release/frpc-tray`
 3. Run the app and use the tray icon:
    - `启动 frpc` / `停止 frpc` — start or stop the client
    - `配置` — pick the active configuration file
+   - `STUN 服务器` — probe public STUN servers, see their quality, and apply the chosen one
+     to the active config (see below)
    - `自动启动` — toggle start-on-login
    - `检查更新` — check for and install a newer frp release
    - `重新下载 frpc` — delete and re-fetch the binary
@@ -103,6 +110,93 @@ On Linux the tray icon appears in the notification area / panel; on macOS it app
 menu bar. macOS builds downloaded from GitHub are unsigned: if Gatekeeper blocks the `.app`,
 right-click it and choose **Open**, or run
 `xattr -d com.apple.quarantine frpc-tray.app`.
+
+### STUN servers
+
+frp uses a STUN server to learn its public address before attempting NAT hole punching
+(`natHoleStunServer` in `frpc.toml`, `[common] nat_hole_stun_server` in the legacy
+`frpc.ini`). Public STUN servers vary a lot in reachability and latency from a given network,
+so the `STUN 服务器` submenu lets you measure and choose one:
+
+| Menu item | What it does |
+| --- | --- |
+| `当前: <addr> · 38ms 优 · 出口 1.2.3.4` | Value of the active config plus its measured quality and the public IP the server sees |
+| `候选 N 个 · 可用 M 个 · 刚刚测速` | Size of the probed list and how old the result is |
+| Server list | Fastest servers, `host:port  <latency>  <grade>`. Clicking one writes it into the active config and restarts `frpc` if it is running. `★` marks your own nodes; they are always shown, even when slow or unreachable |
+| `测速并刷新列表` | Re-download every source and probe all candidates again |
+| `添加自定义节点…` | Native input dialog: type a `host:port` (a bare host name gets `:3478`). The node is appended to `servers.txt` and probed immediately |
+| `添加自定义源…` | Native input dialog for a list URL, a local list file or a single address; appended to `sources.txt` and followed by a full refresh |
+| `编辑节点列表…` / `编辑自定义源…` | Open `servers.txt` / `sources.txt` in the default editor (fallback when no dialog helper is available) |
+| `打开 STUN 目录` | Open `frp/stun` (source files, node list and result cache) |
+| `恢复默认（注释 STUN 项）` | Comment the entry out so frp falls back to its built-in default |
+
+The two `添加…` entries use a small native dialog: a TopMost WinForms form driven by PowerShell on
+Windows, `osascript` on macOS and `zenity` (or `kdialog`) on Linux. If none of those is usable,
+the app logs it and you can still edit the files directly.
+
+Quality is measured with up to three RFC 5389 binding requests per server (the first packet of
+a cold path is allowed to time out, later timeouts are reported as packet loss):
+
+| Grade | Average latency |
+| --- | --- |
+| 优 | ≤ 100 ms |
+| 良 | ≤ 250 ms |
+| 一般 | ≤ 500 ms |
+| 差 | > 500 ms |
+| 不可用 | no valid response |
+
+Results are cached in `frp/stun/cache.json`, so the menu is populated instantly on start and a
+fresh probe only runs when the cache is older than six hours (or from the menu). Probing never
+blocks the UI: the work happens on a background thread pool (32 workers).
+
+#### How the value is written
+
+Many configs keep a commented list of candidate servers next to the one in use:
+
+```toml
+# natHoleStunServer = "stun.hitv.com:3478"
+# natHoleStunServer = "stun.cheapvoip.com:3478"
+natHoleStunServer = "stun.miwifi.com:3478"
+```
+
+Picking a server always reuses the line that is **in effect** (here the `stun.miwifi.com` one) and
+leaves the commented candidates untouched. Filling in a commented line while another one is
+active would define the key twice, which frp rejects with
+`toml: line N: key natHoleStunServer is already defined`.
+
+If a config already contains several active copies (hand edited, or written by an older build),
+the app comments the extra ones out before handing the file to `frpc`, and logs
+`… 中有 N 处重复的 STUN 项，已注释多余行`. `恢复默认` comments out every active copy.
+
+#### Custom nodes and sources
+
+Two separate files, both created on first run:
+
+**`frp/stun/servers.txt`** — your own STUN nodes, one `host:port` per line, `#` starts a comment.
+These are probed first and are always listed in the menu with a `★` marker:
+
+```text
+stun.myserver.com:3478
+192.168.1.10:3478        # 内网测试服务器
+```
+
+**`frp/stun/sources.txt`** — where candidate lists come from; a file can mix three kinds of lines:
+
+```text
+# 1) remote list — any URL whose body contains host:port entries
+https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_hosts.txt
+
+# 2) local file — absolute path to a list of host:port entries
+/data/stun-servers.txt
+
+# 3) direct entries (same effect as a line in servers.txt)
+stun.backup.example.com:3478
+```
+
+Remote lists may separate entries with spaces, commas or semicolons and may carry trailing
+comments. Duplicates are removed case-insensitively, across nodes and sources. If no source can be
+reached and there is no cache yet, your custom nodes plus a small built-in list keep the menu
+working offline.
 
 ### Runtime file layout
 
@@ -131,6 +225,10 @@ inside it).
     ├── debug.log             # download/update diagnostics
     ├── config/               # your frpc configuration files (*.toml, *.ini)
     │   └── frpc.toml
+    ├── stun/
+    │   ├── sources.txt       # STUN server sources (editable, or via the menu)
+    │   ├── servers.txt       # your own STUN nodes (★ in the menu)
+    │   └── cache.json        # last probe results, reused on the next start
     └── logs/
         ├── frpc-tray.log     # application events
         └── frpc.log          # frpc output

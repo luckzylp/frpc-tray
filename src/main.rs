@@ -5,8 +5,10 @@
 mod autostart;
 mod config;
 mod frpc;
+mod frpconf;
 mod logger;
 mod platform;
+mod stun;
 mod tray;
 
 use std::path::PathBuf;
@@ -23,8 +25,18 @@ use frpc::{FRP_VERSION, check_update, ensure_frpc, start_frpc, stop_frpc};
 use platform::BINARY_NAME;
 use tray::{
     AppState, ID_AUTOSTART, ID_CHECK_UPDATE, ID_CONFIG_PREFIX, ID_QUIT, ID_REDOWNLOAD, ID_START,
-    ID_STOP, SharedState, build_menu,
+    ID_STOP, ID_STUN_ADD_NODE, ID_STUN_ADD_SOURCE, ID_STUN_EDIT_NODES, ID_STUN_EDIT_SOURCES,
+    ID_STUN_OPEN_DIR, ID_STUN_PREFIX, ID_STUN_REFRESH, ID_STUN_RESTORE, SharedState, build_menu,
 };
+
+/// What the user is being asked to type.
+#[derive(Clone, Copy, Debug)]
+enum PromptKind {
+    /// A single `host:port` STUN node.
+    Node,
+    /// A source line: URL, local list file or address.
+    Source,
+}
 
 fn main() {
     let instance = match single_instance::SingleInstance::new(&single_instance_name()) {
@@ -64,6 +76,21 @@ fn main() {
     ensure_frpc_async(&dl_tx, &current_ver);
 
     silent_check_update_async(&state, &current_ver);
+
+    // STUN: show the cached result immediately and only re-probe when the cache
+    // is stale, so a usual start does not fire a few hundred UDP packets.
+    let (stun_tx, stun_rx) = std::sync::mpsc::channel::<stun::StunEvent>();
+    let (prompt_tx, prompt_rx) =
+        std::sync::mpsc::channel::<(PromptKind, Result<Option<String>, String>)>();
+    stun::ensure_sources_file();
+    stun::ensure_servers_file();
+    let should_probe_stun = match state.lock() {
+        Ok(mut s) => s.stun.restore_from_cache(),
+        Err(_) => false,
+    };
+    if should_probe_stun {
+        begin_stun_refresh(&state, &stun_tx);
+    }
 
     #[allow(unused_mut)]
     let mut event_loop = EventLoop::new();
@@ -113,9 +140,47 @@ fn main() {
             }
         }
 
+        while let Ok(event) = stun_rx.try_recv() {
+            let mut changed = true;
+            match event {
+                stun::StunEvent::Done { results, notes } => {
+                    if let Ok(mut s) = state_clone.lock() {
+                        s.stun.apply(results, notes);
+                    }
+                }
+                stun::StunEvent::Single(result) => {
+                    if let Ok(mut s) = state_clone.lock() {
+                        s.stun.upsert(result);
+                    }
+                }
+                stun::StunEvent::Started => changed = false,
+            }
+            if changed {
+                rebuild(&tray_clone, &state_clone);
+            }
+        }
+
+        while let Ok((kind, result)) = prompt_rx.try_recv() {
+            match result {
+                Ok(Some(value)) => {
+                    handle_prompt_value(&state_clone, kind, &value, &stun_tx);
+                    rebuild(&tray_clone, &state_clone);
+                }
+                Ok(None) => logger::log("已取消输入"),
+                Err(e) => logger::log(&format!("{}；可直接编辑 {}", e, stun::stun_dir().display())),
+            }
+        }
+
         while let Ok(menu_event) = MenuEvent::receiver().try_recv() {
             let id = menu_event.id.0.clone();
-            handle_menu_event(&id, &state_clone, &tray_clone, control_flow);
+            handle_menu_event(
+                &id,
+                &state_clone,
+                &tray_clone,
+                control_flow,
+                &stun_tx,
+                &prompt_tx,
+            );
         }
     });
 }
@@ -143,6 +208,8 @@ fn handle_menu_event(
     state: &SharedState,
     tray: &tray_icon::TrayIcon,
     control_flow: &mut ControlFlow,
+    stun_tx: &std::sync::mpsc::Sender<stun::StunEvent>,
+    prompt_tx: &std::sync::mpsc::Sender<(PromptKind, Result<Option<String>, String>)>,
 ) {
     if id == ID_START {
         start_command(state);
@@ -159,10 +226,29 @@ fn handle_menu_event(
         check_update_command(state);
     } else if id == ID_REDOWNLOAD {
         redownload_command(state);
+    } else if id == ID_STUN_REFRESH {
+        begin_stun_refresh(state, stun_tx);
+        rebuild(tray, state);
+    } else if id == ID_STUN_RESTORE {
+        restore_stun_default(state);
+        rebuild(tray, state);
+    } else if id == ID_STUN_ADD_NODE {
+        ask_for_stun_entry(PromptKind::Node, prompt_tx);
+    } else if id == ID_STUN_ADD_SOURCE {
+        ask_for_stun_entry(PromptKind::Source, prompt_tx);
+    } else if id == ID_STUN_EDIT_NODES {
+        open_stun_file(&stun::custom_servers_path());
+    } else if id == ID_STUN_EDIT_SOURCES {
+        open_stun_file(&stun::sources_path());
+    } else if id == ID_STUN_OPEN_DIR {
+        open_stun_file(&stun::stun_dir());
     } else if id == ID_QUIT {
         quit_command(state, control_flow);
     } else if let Some(name) = id.strip_prefix(ID_CONFIG_PREFIX) {
         switch_config(state, name.to_string());
+        rebuild(tray, state);
+    } else if let Some(addr) = id.strip_prefix(ID_STUN_PREFIX) {
+        apply_stun_server(state, addr);
         rebuild(tray, state);
     }
 }
@@ -209,20 +295,25 @@ fn start_command(state: &SharedState) {
             return;
         }
     };
-    let config_name = match &s.current_config {
-        Some(c) => c.clone(),
-        None => match config::default_config(&config::list_configs()) {
-            Some(c) => c.clone(),
-            None => {
-                logger::log("没有可用的配置文件");
-                return;
-            }
-        },
+    let Some(config_name) = s.resolved_config() else {
+        logger::log("没有可用的配置文件");
+        return;
     };
     let config_path = config::configs_dir().join(&config_name);
     if !config_path.exists() {
         logger::log(&format!("配置文件不存在: {}", config_path.display()));
         return;
+    }
+    // Older builds could leave two active `natHoleStunServer` lines behind,
+    // which makes frpc refuse to start. Collapse them before handing the file
+    // over, so a stale duplicate never blocks the client again.
+    match frpconf::repair_stun_duplicates(&config_path) {
+        Ok(0) => {}
+        Ok(n) => logger::log(&format!(
+            "{} 中有 {} 处重复的 STUN 项，已注释多余行",
+            config_name, n
+        )),
+        Err(e) => logger::log(&format!("检查 STUN 配置失败: {}", e)),
     }
     match start_frpc(&exe, &config_path) {
         Ok(child) => {
@@ -243,21 +334,154 @@ fn stop_command(state: &SharedState) {
     }
 }
 
+fn restart_if_running(state: &SharedState) {
+    if state.lock().map(|s| s.is_running()).unwrap_or(false) {
+        logger::log("配置已变更，重启 frpc...");
+        stop_command(state);
+        start_command(state);
+    }
+}
+
 fn switch_config(state: &SharedState, name: String) {
-    let was_running;
     {
         let mut s = state.lock().unwrap();
-        was_running = s.is_running();
         s.current_config = Some(name.clone());
         s.settings.last_config = Some(name.clone());
         s.settings.save();
     }
 
     logger::log(&format!("切换配置: {}", name));
+    restart_if_running(state);
+}
 
-    if was_running {
-        stop_command(state);
-        start_command(state);
+/// Probe every configured source on a worker thread; the result arrives through
+/// the channel polled by the event loop.
+fn begin_stun_refresh(state: &SharedState, stun_tx: &std::sync::mpsc::Sender<stun::StunEvent>) {
+    {
+        let Ok(mut s) = state.lock() else {
+            return;
+        };
+        if s.stun.probing {
+            return;
+        }
+        s.stun.probing = true;
+        s.stun.notes.clear();
+    }
+    logger::log("STUN: 正在获取服务器列表并测速...");
+    stun::refresh(stun_tx.clone());
+}
+
+/// Write the picked server into the active config file and apply it.
+fn apply_stun_server(state: &SharedState, addr: &str) {
+    let config_name = match state.lock() {
+        Ok(s) => s.resolved_config(),
+        Err(_) => return,
+    };
+    let Some(name) = config_name else {
+        logger::log("没有可用的配置文件，无法写入 STUN 设置");
+        return;
+    };
+    let path = config::configs_dir().join(&name);
+    if frpconf::read_stun_server(&path).as_deref() == Some(addr) {
+        logger::log(&format!("{} 已在使用 {}", name, addr));
+        return;
+    }
+    match frpconf::set_stun_server(&path, addr) {
+        Ok(replaced) => {
+            logger::log(&format!(
+                "STUN 服务器{}：{} → {}",
+                if replaced { "已更新" } else { "已写入" },
+                name,
+                addr
+            ));
+        }
+        Err(e) => {
+            logger::log(&format!("写入 STUN 设置失败: {}", e));
+            return;
+        }
+    }
+    restart_if_running(state);
+}
+
+/// Comment the entry out so frp uses its built-in default again.
+fn restore_stun_default(state: &SharedState) {
+    let config_name = match state.lock() {
+        Ok(s) => s.resolved_config(),
+        Err(_) => return,
+    };
+    let Some(name) = config_name else {
+        logger::log("没有可用的配置文件");
+        return;
+    };
+    let path = config::configs_dir().join(&name);
+    match frpconf::clear_stun_server(&path) {
+        Ok(true) => {
+            logger::log(&format!(
+                "已注释 {} 中的 STUN 项，frp 将使用默认服务器",
+                name
+            ));
+            restart_if_running(state);
+        }
+        Ok(false) => logger::log(&format!("{} 中没有生效的 STUN 项", name)),
+        Err(e) => logger::log(&format!("恢复默认 STUN 失败: {}", e)),
+    }
+}
+
+fn open_stun_file(path: &std::path::Path) {
+    match platform::open_path(path) {
+        Ok(()) => logger::log(&format!("已打开 {}", path.display())),
+        Err(e) => logger::log(&format!("打开 {} 失败: {}", path.display(), e)),
+    }
+}
+
+/// Show the native text prompt on a worker thread; the answer comes back
+/// through the channel so the tray event loop is never blocked.
+fn ask_for_stun_entry(
+    kind: PromptKind,
+    prompt_tx: &std::sync::mpsc::Sender<(PromptKind, Result<Option<String>, String>)>,
+) {
+    let tx = prompt_tx.clone();
+    thread::spawn(move || {
+        let (title, message, default) = match kind {
+            PromptKind::Node => (
+                "添加自定义 STUN 节点",
+                "输入 STUN 服务器地址，格式 host:port（只填域名则默认 3478 端口）",
+                "stun.example.com:3478",
+            ),
+            PromptKind::Source => (
+                "添加自定义 STUN 源",
+                "输入远程列表 URL、本地列表文件路径，或一个 host:port",
+                "https://",
+            ),
+        };
+        let result = platform::prompt_text(title, message, default);
+        let _ = tx.send((kind, result));
+    });
+}
+
+fn handle_prompt_value(
+    state: &SharedState,
+    kind: PromptKind,
+    value: &str,
+    stun_tx: &std::sync::mpsc::Sender<stun::StunEvent>,
+) {
+    match kind {
+        PromptKind::Node => match stun::add_custom_server(value) {
+            Ok(Some(addr)) => {
+                logger::log(&format!("已添加自定义 STUN 节点: {}", addr));
+                stun::probe_custom_async(addr, stun_tx.clone());
+            }
+            Ok(None) => logger::log(&format!("节点已存在: {}", value.trim())),
+            Err(e) => logger::log(&format!("添加节点失败: {}", e)),
+        },
+        PromptKind::Source => match stun::add_custom_source(value) {
+            Ok(true) => {
+                logger::log(&format!("已添加 STUN 源: {}", value.trim()));
+                begin_stun_refresh(state, stun_tx);
+            }
+            Ok(false) => logger::log(&format!("源已存在: {}", value.trim())),
+            Err(e) => logger::log(&format!("添加源失败: {}", e)),
+        },
     }
 }
 
